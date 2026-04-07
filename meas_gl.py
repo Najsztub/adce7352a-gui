@@ -4,12 +4,13 @@ import pyvisa
 import numpy as np
 
 from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtGui import QPainter, QColor
 # Add QOpenGLWidget to your existing QtWidgets import
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
                              QWidget, QPushButton, QComboBox, QLabel, QGroupBox, 
                              QLCDNumber, QLineEdit, QStatusBar, QFormLayout, QCheckBox, QMessageBox,
                              QOpenGLWidget, QTabWidget, QSpinBox, QDoubleSpinBox, QListWidget, 
-                             QListWidgetItem, QTextEdit) 
+                             QListWidgetItem, QTextEdit)
 from OpenGL.GL import *
 from OpenGL.GL import GL_TEXTURE_2D
 
@@ -98,12 +99,57 @@ class DMMGLPlot(QOpenGLWidget):
         self.data_a = np.zeros(200)
         self.data_b = np.zeros(200)
         self.min_val, self.max_val = -1.0, 1.0
+        self.min_val_default = -1.0
+        self.max_val_default = 1.0
         self.setMinimumHeight(150)
         
         # Annotation support
         self.annotations = []  # List of (x, y, text, color) tuples
         self.enable_annotations = False
         self.stats_display = {}  # Dict for statistics display
+        
+        # Channel enable flags
+        self.enable_a = True
+        self.enable_b = False
+        
+        # Axis labels
+        self.x_label = "Time (samples)"
+        self.y_label = "Value"
+        
+        # Zoom and pan support
+        self.zoom_level = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
+
+    def set_channel_enabled(self, channel, enabled):
+        """Set whether a channel should be plotted."""
+        if channel == "A":
+            self.enable_a = enabled
+        elif channel == "B":
+            self.enable_b = enabled
+        self.update()
+    
+    def reset_zoom(self):
+        """Reset zoom and pan to default state."""
+        self.zoom_level = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self.update()
+    
+    def wheelEvent(self, event):
+        """Handle mouse wheel zoom."""
+        if event.angleDelta().y() > 0:
+            # Scroll up: zoom in
+            self.zoom_level *= 1.1
+        else:
+            # Scroll down: zoom out
+            self.zoom_level /= 1.1
+        # Clamp zoom level
+        self.zoom_level = np.clip(self.zoom_level, 0.1, 10.0)
+        self.update()
+        event.accept()
 
     def update_readings(self, val_a, val_b):
         # Shift buffer and insert new value
@@ -112,14 +158,37 @@ class DMMGLPlot(QOpenGLWidget):
         self.data_a[-1] = val_a
         self.data_b[-1] = val_b
         
-        # Update auto-scale bounds
-        all_vals = np.concatenate([self.data_a, self.data_b])
-        valid = all_vals[np.isfinite(all_vals)]
-        if len(valid) > 0:
-            self.min_val = np.min(valid) * 1.1
-            self.max_val = np.max(valid) * 1.1
-            if self.max_val == self.min_val:
-                self.max_val += 1.0
+        # Update auto-scale bounds with only enabled channels
+        vals_to_use = []
+        if self.enable_a:
+            vals_to_use.extend(self.data_a)
+        if self.enable_b:
+            vals_to_use.extend(self.data_b)
+        
+        if vals_to_use:
+            all_vals = np.array(vals_to_use)
+            valid = all_vals[np.isfinite(all_vals)]
+            if len(valid) > 0:
+                min_v = np.min(valid)
+                max_v = np.max(valid)
+                # Add 10% margin
+                margin = (max_v - min_v) * 0.1
+                if margin == 0:
+                    margin = 0.5
+                self.min_val_default = min_v - margin
+                self.max_val_default = max_v + margin
+            else:
+                self.min_val_default, self.max_val_default = -1.0, 1.0
+        else:
+            self.min_val_default, self.max_val_default = -1.0, 1.0
+        
+        # Apply zoom to the defaults
+        center_y = (self.min_val_default + self.max_val_default) / 2
+        height = self.max_val_default - self.min_val_default
+        zoomed_height = height / self.zoom_level
+        self.min_val = center_y - zoomed_height / 2 + self.pan_y
+        self.max_val = center_y + zoomed_height / 2 + self.pan_y
+        
         self.update()
     
     def add_annotation(self, x, y, text, color=(1.0, 1.0, 1.0)):
@@ -131,6 +200,48 @@ class DMMGLPlot(QOpenGLWidget):
         """Clear all annotations."""
         self.annotations.clear()
         self.update()
+    
+    def render_labels(self):
+        """Render axis labels and values using QPainter."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setFont(painter.font())
+        
+        w, h = self.width(), self.height()
+        left_margin = 50
+        bottom_margin = 30
+        
+        # Draw Y-axis values on the left
+        painter.setPen(QColor(128, 128, 128))
+        y_step = (self.max_val - self.min_val) / 5
+        for i in range(6):
+            y_val = self.min_val + i * y_step
+            # Screen position
+            y_screen = h - bottom_margin - (i / 5) * (h - bottom_margin)
+            label = f"{y_val:.2g}"
+            painter.drawText(5, int(y_screen) - 5, 40, 20, Qt.AlignRight, label)
+        
+        # Draw X-axis label at bottom
+        painter.drawText(w - 120, h - 5, self.x_label)
+        
+        # Draw Y-axis label on left (rotated)
+        painter.save()
+        painter.translate(15, h // 2)
+        painter.rotate(-90)
+        painter.drawText(0, 0, self.y_label)
+        painter.restore()
+        
+        # Draw annotation text labels
+        if self.enable_annotations and self.annotations:
+            painter.setPen(QColor(200, 200, 100))
+            for x, y, text, _ in self.annotations:
+                # Convert GL coordinates to screen coordinates
+                x_norm = (x / 200.0) * (w - left_margin) + left_margin
+                y_norm = h - bottom_margin - ((y - self.min_val) / (self.max_val - self.min_val)) * (h - bottom_margin)
+                if 0 <= x_norm < w and 0 <= y_norm < h:
+                    painter.drawText(int(x_norm) + 5, int(y_norm) - 10, text)
+        
+        painter.end()
     
     def set_statistics(self, stats_dict):
         """Update statistics for display."""
@@ -168,20 +279,23 @@ class DMMGLPlot(QOpenGLWidget):
             glVertex2f(200, y)
         glEnd()
 
-        # Plot Channel A (Green)
-        glColor3f(0.0, 1.0, 0.5)
-        glLineWidth(2.0)
-        glBegin(GL_LINE_STRIP)
-        for i, val in enumerate(self.data_a):
-            if np.isfinite(val): glVertex2f(i, val)
-        glEnd()
+        # Plot Channel A (Green) - only if enabled
+        if self.enable_a:
+            glColor3f(0.0, 1.0, 0.5)
+            glLineWidth(2.0)
+            glBegin(GL_LINE_STRIP)
+            for i, val in enumerate(self.data_a):
+                if np.isfinite(val): glVertex2f(i, val)
+            glEnd()
 
-        # Plot Channel B (Cyan)
-        glColor3f(0.0, 0.85, 1.0)
-        glBegin(GL_LINE_STRIP)
-        for i, val in enumerate(self.data_b):
-            if np.isfinite(val): glVertex2f(i, val)
-        glEnd()
+        # Plot Channel B (Cyan) - only if enabled
+        if self.enable_b:
+            glColor3f(0.0, 0.85, 1.0)
+            glLineWidth(2.0)
+            glBegin(GL_LINE_STRIP)
+            for i, val in enumerate(self.data_b):
+                if np.isfinite(val): glVertex2f(i, val)
+            glEnd()
         
         # Draw Annotations
         if self.enable_annotations:
@@ -198,6 +312,9 @@ class DMMGLPlot(QOpenGLWidget):
                 glBegin(GL_POINTS)
                 glVertex2f(x, y)
                 glEnd()
+        
+        # Render text labels using QPainter
+        self.render_labels()
 
 # =============================================================================
 # MAIN APPLICATION WINDOW
@@ -219,78 +336,260 @@ class ADCMT7352GUI(QMainWindow):
     def init_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
+        main_layout = QHBoxLayout(central)
+        main_layout.setSpacing(0)
+        main_layout.setContentsMargins(0, 0, 0, 0)
 
-        # --- Device & Connection Bar ---
-        conn_layout = QHBoxLayout()
-        conn_layout.addWidget(QLabel("Device:"))
-        self.cb_device = QComboBox()
-        self.cb_device.addItems(["Real Device (VISA)", "Mock Device (Testing)"])
-        self.cb_device.currentIndexChanged.connect(self.on_device_changed)
-        conn_layout.addWidget(self.cb_device)
-        
-        self.res_input = QLineEdit("USB0::0x0B21::0x0001::12345678::INSTR")
-        self.res_input.setPlaceholderText("VISA Resource String (e.g., USB0::..., GPIB0::1::INSTR)")
-        conn_layout.addWidget(QLabel("Resource:"))
-        conn_layout.addWidget(self.res_input, 1)
-        
-        self.btn_connect = QPushButton("Connect")
-        self.btn_connect.clicked.connect(self.toggle_connection)
-        conn_layout.addWidget(self.btn_connect)
-        main_layout.addLayout(conn_layout)
+        # Left panel for settings and controls
+        left_panel = self.create_left_panel()
+        left_panel.setFixedWidth(280)
+        main_layout.addWidget(left_panel)
 
-        # --- Tabbed Interface ---
+        # Right panel for tabs (visualization and console)
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(8, 8, 8, 8)
+
         self.tabs = QTabWidget()
         
-        # Tab 1: Channel A Configuration
-        self.tab_a = self.create_channel_tab("Channel A (DSP1)", "A")
-        self.tabs.addTab(self.tab_a, "Channel A")
+        # Tab 1: OpenGL Plot
+        self.tab_plot = QWidget()
+        plot_layout = QVBoxLayout(self.tab_plot)
         
-        # Tab 2: Channel B Configuration
-        self.tab_b = self.create_channel_tab("Channel B (DSP2)", "B")
-        self.tabs.addTab(self.tab_b, "Channel B")
+        # Create plot widget first
+        self.gl_plot = DMMGLPlot()
         
-        # Tab 3: Measurements & Statistics
+        # Button toolbar
+        btn_layout = QHBoxLayout()
+        self.btn_auto_zoom = QPushButton("Auto Zoom")
+        self.btn_auto_zoom.clicked.connect(self.gl_plot.reset_zoom)
+        btn_layout.addWidget(self.btn_auto_zoom)
+        btn_layout.addStretch()
+        plot_layout.addLayout(btn_layout)
+        
+        plot_layout.addWidget(self.gl_plot, 1)
+        self.tabs.addTab(self.tab_plot, "Live Plot")
+        
+        # Tab 2: Measurements & Statistics
         self.tab_meas = self.create_measurements_tab()
         self.tabs.addTab(self.tab_meas, "Measurements")
         
-        main_layout.addWidget(self.tabs)
+        # Tab 3: ADC Console
+        self.tab_console = self.create_console_tab()
+        self.tabs.addTab(self.tab_console, "ADC Console")
+        
+        right_layout.addWidget(self.tabs)
+        main_layout.addWidget(right_panel, 1)
 
-        # --- LCD Displays ---
-        disp_layout = QHBoxLayout()
-        self.lcd_a = QLCDNumber()
-        self.lcd_a.setSegmentStyle(QLCDNumber.Flat)
-        self.lcd_a.setMinimumHeight(60)
-        self.lcd_b = QLCDNumber()
-        self.lcd_b.setSegmentStyle(QLCDNumber.Flat)
-        self.lcd_b.setMinimumHeight(60)
-        disp_layout.addWidget(QLabel("Channel A Value:"))
-        disp_layout.addWidget(self.lcd_a, 1)
-        disp_layout.addWidget(QLabel("Channel B Value:"))
-        disp_layout.addWidget(self.lcd_b, 1)
-        main_layout.addLayout(disp_layout)
+    def create_left_panel(self):
+        """Create the left panel with all settings and controls."""
+        panel = QWidget()
+        panel.setStyleSheet("#leftPanel { background-color: #0d1117; }")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
 
-        # --- OpenGL Plot ---
-        self.gl_plot = DMMGLPlot()
-        main_layout.addWidget(self.gl_plot, 1)
+        # Title
+        title = QLabel("◈ ADCMT 7352A")
+        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #c9d1d9;")
+        layout.addWidget(title)
 
-        # --- Control Buttons ---
-        btn_layout = QHBoxLayout()
+        subtitle = QLabel("Digital Multimeter [ADC mode]")
+        subtitle.setStyleSheet("color: #8b949e; font-size: 11px;")
+        layout.addWidget(subtitle)
+
+        # Status indicator
+        self.status_label = QLabel("DISCONNECTED")
+        self.status_label.setStyleSheet("color: #f85149; font-weight: bold;")
+        self.status_dot = QLabel("●")
+        self.status_dot.setStyleSheet("color: #f85149; font-size: 14px;")
+
+        status_bar = QWidget()
+        sb_layout = QHBoxLayout(status_bar)
+        sb_layout.addWidget(self.status_dot)
+        sb_layout.addWidget(self.status_label)
+        sb_layout.addStretch()
+        layout.addWidget(status_bar)
+
+        # Connection settings card
+        layout.addWidget(self.create_connection_card())
+        
+        # Channel A configuration card
+        layout.addWidget(self.create_channel_card("Channel A (DSP1)", "A"))
+        
+        # Channel B configuration card  
+        layout.addWidget(self.create_channel_card("Channel B (DSP2)", "B"))
+
+        # LCD Displays card
+        layout.addWidget(self.create_display_card())
+
+        # Control buttons card
+        layout.addWidget(self.create_control_card())
+
+        layout.addStretch()
+        return panel
+
+    def create_connection_card(self):
+        """Create the connection settings card."""
+        group = QGroupBox("CONNECTION")
+        group.setStyleSheet("""
+            QGroupBox { border: 1px solid #30363d; border-radius: 4px; margin-top: 12px; padding-top: 8px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #58a6ff; font-weight: bold; }
+        """)
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(10, 12, 10, 10)
+
+        # Device selection
+        device_layout = QHBoxLayout()
+        device_layout.addWidget(QLabel("Device:"))
+        self.cb_device = QComboBox()
+        self.cb_device.addItems(["Real Device (VISA)", "Mock Device (Testing)"])
+        self.cb_device.currentIndexChanged.connect(self.on_device_changed)
+        device_layout.addWidget(self.cb_device)
+        layout.addLayout(device_layout)
+
+        # Resource string
+        res_layout = QHBoxLayout()
+        res_layout.addWidget(QLabel("Resource:"))
+        self.res_input = QLineEdit("USB0::0x0B21::0x0001::12345678::INSTR")
+        self.res_input.setPlaceholderText("VISA Resource String")
+        res_layout.addWidget(self.res_input, 1)
+        layout.addLayout(res_layout)
+
+        # Connect button
+        self.btn_connect = QPushButton("Connect")
+        self.btn_connect.clicked.connect(self.toggle_connection)
+        layout.addWidget(self.btn_connect)
+
+        return group
+
+    def create_channel_card(self, title, channel):
+        """Create a channel configuration card."""
+        group = QGroupBox(title)
+        group.setStyleSheet("""
+            QGroupBox { border: 1px solid #30363d; border-radius: 4px; margin-top: 12px; padding-top: 8px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #58a6ff; font-weight: bold; }
+        """)
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(10, 12, 10, 10)
+
+        # Enable checkbox
+        cb_enable = QCheckBox("Enable Channel")
+        cb_enable.setChecked(channel == "A")
+        setattr(self, f"chk_enable_{channel}", cb_enable)
+        layout.addWidget(cb_enable)
+
+        # Function selection
+        func_layout = QHBoxLayout()
+        func_layout.addWidget(QLabel("Function:"))
+        cb_func = QComboBox()
+        cb_func.addItems(ADC_FUNCS.keys())
+        setattr(self, f"cb_func_{channel}", cb_func)
+        func_layout.addWidget(cb_func)
+        layout.addLayout(func_layout)
+
+        # Function description
+        label_display = QLabel()
+        label_display.setStyleSheet("color: #888;")
+        setattr(self, f"lbl_func_{channel}", label_display)
+        layout.addWidget(label_display)
+        cb_func.currentTextChanged.connect(
+            lambda text: self.update_function_label(channel, text))
+        self.update_function_label(channel, cb_func.currentText())
+
+        # Range selection
+        range_layout = QHBoxLayout()
+        range_layout.addWidget(QLabel("Range:"))
+        cb_range = QComboBox()
+        cb_range.addItems(ADC_RANGES.keys())
+        setattr(self, f"cb_rng_{channel}", cb_range)
+        range_layout.addWidget(cb_range)
+        layout.addLayout(range_layout)
+
+        # Rate selection
+        rate_layout = QHBoxLayout()
+        rate_layout.addWidget(QLabel("Rate:"))
+        cb_rate = QComboBox()
+        cb_rate.addItems(ADC_RATES.keys())
+        setattr(self, f"cb_rate_{channel}", cb_rate)
+        rate_layout.addWidget(cb_rate)
+        layout.addLayout(rate_layout)
+
+        # Trigger selection
+        trig_layout = QHBoxLayout()
+        trig_layout.addWidget(QLabel("Trigger:"))
+        cb_trig = QComboBox()
+        cb_trig.addItems(ADC_TRIGS.keys())
+        setattr(self, f"cb_trig_{channel}", cb_trig)
+        trig_layout.addWidget(cb_trig)
+        layout.addLayout(trig_layout)
+
+        return group
+
+    def create_display_card(self):
+        """Create the LCD display card."""
+        group = QGroupBox("LIVE READINGS")
+        group.setStyleSheet("""
+            QGroupBox { border: 1px solid #30363d; border-radius: 4px; margin-top: 12px; padding-top: 8px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #58a6ff; font-weight: bold; }
+        """)
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(10, 12, 10, 10)
+
+        # Channel A display
+        a_layout = QVBoxLayout()
+        a_layout.addWidget(QLabel("Channel A:"))
+        self.lbl_a = QLabel("--")
+        self.lbl_a.setStyleSheet("font-family: monospace; font-size: 16px; color: #00ff80; padding: 8px; background-color: #0d1117; border: 1px solid #30363d; border-radius: 3px;")
+        self.lbl_a.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.lbl_a.setMinimumHeight(50)
+        a_layout.addWidget(self.lbl_a)
+        layout.addLayout(a_layout)
+
+        # Channel B display
+        b_layout = QVBoxLayout()
+        b_layout.addWidget(QLabel("Channel B:"))
+        self.lbl_b = QLabel("--")
+        self.lbl_b.setStyleSheet("font-family: monospace; font-size: 16px; color: #00d9ff; padding: 8px; background-color: #0d1117; border: 1px solid #30363d; border-radius: 3px;")
+        self.lbl_b.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.lbl_b.setMinimumHeight(50)
+        b_layout.addWidget(self.lbl_b)
+        layout.addLayout(b_layout)
+
+        return group
+
+    def create_control_card(self):
+        """Create the control buttons card."""
+        group = QGroupBox("CONTROLS")
+        group.setStyleSheet("""
+            QGroupBox { border: 1px solid #30363d; border-radius: 4px; margin-top: 12px; padding-top: 8px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #58a6ff; font-weight: bold; }
+        """)
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(10, 12, 10, 10)
+
+        # Apply settings button
         self.btn_apply = QPushButton("Apply Settings")
         self.btn_apply.clicked.connect(self.apply_settings)
+        layout.addWidget(self.btn_apply)
+
+        # Command buttons
+        cmd_layout = QHBoxLayout()
         self.btn_init = QPushButton("Initiate (INI)")
         self.btn_init.clicked.connect(lambda: self.send_cmd("INI"))
+        cmd_layout.addWidget(self.btn_init)
+
         self.btn_abort = QPushButton("Abort (ABO)")
         self.btn_abort.clicked.connect(lambda: self.send_cmd("ABO"))
+        cmd_layout.addWidget(self.btn_abort)
+        layout.addLayout(cmd_layout)
+
+        # Continuous read checkbox
         self.chk_cont = QCheckBox("Continuous Read")
         self.chk_cont.stateChanged.connect(self.toggle_continuous)
-        
-        btn_layout.addWidget(self.btn_apply)
-        btn_layout.addWidget(self.btn_init)
-        btn_layout.addWidget(self.btn_abort)
-        btn_layout.addWidget(self.chk_cont)
-        btn_layout.addStretch()
-        main_layout.addLayout(btn_layout)
+        layout.addWidget(self.chk_cont)
+
+        return group
 
     def create_channel_tab(self, title, channel):
         """Create a configuration tab for a channel."""
@@ -410,6 +709,57 @@ class ADCMT7352GUI(QMainWindow):
         layout.addStretch()
         return widget
     
+    def create_console_tab(self):
+        """Create the ADC console tab for debugging and manual commands."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        # Command input area
+        cmd_layout = QHBoxLayout()
+        
+        cmd_layout.addWidget(QLabel("CMD:"))
+        
+        self.cmd_edit = QLineEdit()
+        self.cmd_edit.setPlaceholderText("Enter ADC command...")
+        self.cmd_edit.returnPressed.connect(self.send_console_cmd)
+        cmd_layout.addWidget(self.cmd_edit, 1)
+        
+        self.send_btn = QPushButton("SEND")
+        self.send_btn.clicked.connect(self.send_console_cmd)
+        cmd_layout.addWidget(self.send_btn)
+        
+        self.clear_console_btn = QPushButton("CLEAR")
+        self.clear_console_btn.clicked.connect(self.clear_console)
+        cmd_layout.addWidget(self.clear_console_btn)
+        
+        self.rst_btn = QPushButton("*RST")
+        self.rst_btn.setStyleSheet("color: #f85149;")
+        self.rst_btn.clicked.connect(lambda: self.send_cmd("*RST"))
+        cmd_layout.addWidget(self.rst_btn)
+        
+        self.cls_btn = QPushButton("*CLS")
+        self.cls_btn.setStyleSheet("color: #d29922;")
+        self.cls_btn.clicked.connect(lambda: self.send_cmd("*CLS"))
+        cmd_layout.addWidget(self.cls_btn)
+        
+        layout.addLayout(cmd_layout)
+
+        # Console output area
+        self.console_text = QTextEdit()
+        self.console_text.setReadOnly(True)
+        self.console_text.setStyleSheet("""
+            QTextEdit { background-color: #0d1117; color: #c9d1d9; 
+                       font-family: Consolas, monospace; font-size: 10px; }
+        """)
+        layout.addWidget(self.console_text)
+
+        # Initialize console with info
+        self.log_console("ADCMT 7352A [ADC mode, \\r\\n termination]", "info")
+        self.log_console("Free-run: instrument streams data → bare read() used for acquisition.", "info")
+
+        return widget
+    
     def on_device_changed(self, index):
         """Handle device selection change."""
         self.use_mock = (index == 1)
@@ -417,7 +767,7 @@ class ADCMT7352GUI(QMainWindow):
     
     def toggle_annotations(self, state):
         """Enable/disable annotations on the plot."""
-        self.gl_plot.enable_annotations = (state == Qt.Checked)
+        self.gl_plot.enable_annotations = (state == 2)  # Qt.CheckState.Checked
         if not self.gl_plot.enable_annotations:
             self.gl_plot.clear_annotations()
         self.gl_plot.update()
@@ -453,6 +803,73 @@ class ADCMT7352GUI(QMainWindow):
                 if self.chk_annot_avg.isChecked():
                     avg_val = np.mean(valid_data)
                     self.gl_plot.add_annotation(100, avg_val, "Avg", (1.0, 1.0, 0.0))
+
+    # =============================================================================
+    # CONSOLE & DEBUGGING METHODS
+    # =============================================================================
+    def log_console(self, text, tag="info"):
+        """Log a message to the console with timestamp and color coding."""
+        if not hasattr(self, 'console_text') or self.console_text is None:
+            return
+        
+        colors = {
+            "info": "#8b949e", 
+            "cmd": "#58a6ff", 
+            "resp": "#c9d1d9",
+            "err": "#f85149", 
+            "ok": "#3fb950"
+        }
+        color = colors.get(tag, "#c9d1d9")
+        
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        
+        # Append to console with color styling
+        current_text = self.console_text.toPlainText()
+        new_text = f"[{timestamp}] {text}\n"
+        self.console_text.setPlainText(current_text + new_text)
+        
+        # Auto-scroll to bottom
+        scrollbar = self.console_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+    
+    def send_console_cmd(self):
+        """Send a command from the console input."""
+        cmd = self.cmd_edit.text().strip()
+        if not cmd:
+            return
+        
+        if not self.inst:
+            self.log_console("Not connected", "err")
+            return
+        
+        self.log_console(f">> {cmd}", "cmd")
+        
+        try:
+            if cmd.endswith("?"):
+                resp = self.inst.query(cmd)
+                if resp:
+                    self.log_console(f"<< {resp}", "resp")
+                else:
+                    self.log_console("<< (empty)", "err")
+            else:
+                self.inst.write(cmd)
+                # Check for errors
+                err_resp = self.inst.query("ERR?")
+                if err_resp and not err_resp.startswith("+000"):
+                    self.log_console(f"   ERR? -> {err_resp}", "err")
+                else:
+                    self.log_console(f"Sent: {cmd}", "ok")
+        except Exception as e:
+            self.log_console(f"Error: {e}", "err")
+        
+        self.cmd_edit.clear()
+    
+    def clear_console(self):
+        """Clear the console output."""
+        if hasattr(self, 'console_text'):
+            self.console_text.clear()
+            self.log_console("Console cleared", "info")
 
     # =============================================================================
     # METRIC NOTATION FORMATTING
@@ -541,14 +958,16 @@ class ADCMT7352GUI(QMainWindow):
             self.inst.close()
             self.inst = None
             self.btn_connect.setText("Connect")
-            self.statusBar().showMessage("Disconnected.")
+            self._update_status(False)
+            self.log_console("Disconnected.", "info")
             return
 
         try:
             if self.use_mock:
                 self.inst = MockDMMDevice()
                 self.btn_connect.setText("Disconnect")
-                self.statusBar().showMessage("Connected to Mock Device")
+                self._update_status(True)
+                self.log_console("Connected to Mock Device", "ok")
             else:
                 rm = pyvisa.ResourceManager()
                 self.inst = rm.open_resource(self.res_input.text())
@@ -563,19 +982,33 @@ class ADCMT7352GUI(QMainWindow):
                 self.send_cmd("DSP2,F12")# Default DCV-Bch
                 
                 self.btn_connect.setText("Disconnect")
-                self.statusBar().showMessage(f"Connected to {self.res_input.text()}")
+                self._update_status(True)
+                self.log_console(f"Connected to {self.res_input.text()}", "ok")
             
             self.apply_settings()
         except Exception as e:
             QMessageBox.critical(self, "Connection Error", str(e))
             self.inst = None
+            self._update_status(False)
+
+    def _update_status(self, connected):
+        """Update the connection status indicators."""
+        if connected:
+            self.status_label.setText("CONNECTED")
+            self.status_label.setStyleSheet("color: #3fb950; font-weight: bold;")
+            self.status_dot.setStyleSheet("color: #3fb950; font-size: 14px;")
+        else:
+            self.status_label.setText("DISCONNECTED")
+            self.status_label.setStyleSheet("color: #f85149; font-weight: bold;")
+            self.status_dot.setStyleSheet("color: #f85149; font-size: 14px;")
 
     def send_cmd(self, cmd):
         if not self.inst: return
         try:
             self.inst.write(cmd)
+            self.log_console(f"Sent: {cmd}", "ok")
         except Exception as e:
-            self.statusBar().showMessage(f"Cmd Error: {e}")
+            self.log_console(f"Cmd Error: {e}", "err")
 
     def apply_settings(self):
         if not self.inst: return
@@ -594,10 +1027,10 @@ class ADCMT7352GUI(QMainWindow):
             self.send_cmd(f"DSP2,{ADC_RATES[self.cb_rate_B.currentText()]}")
             self.send_cmd(f"DSP2,{ADC_TRIGS[self.cb_trig_B.currentText()]}")
         
-        self.statusBar().showMessage("Settings applied.")
+        self.log_console("Settings applied.", "ok")
 
     def toggle_continuous(self, state):
-        self.is_continuous = (state == Qt.Checked)
+        self.is_continuous = (state == 2)  # Qt.CheckState.Checked
         if self.is_continuous and self.inst:
             self.poll_timer.start(500) # 500ms polling
         else:
@@ -606,6 +1039,10 @@ class ADCMT7352GUI(QMainWindow):
     def poll_readings(self):
         if not self.inst: return
         try:
+            # Update plot channel enable status
+            self.gl_plot.set_channel_enabled("A", self.chk_enable_A.isChecked())
+            self.gl_plot.set_channel_enabled("B", self.chk_enable_B.isChecked())
+            
             # Query both displays. ADC format: S±DD...DDE±DD,
             resp_a = self.inst.query("DSP1,MD?").strip()
             resp_b = self.inst.query("DSP2,MD?").strip()
@@ -613,30 +1050,36 @@ class ADCMT7352GUI(QMainWindow):
             val_a = self.parse_adc_response(resp_a)
             val_b = self.parse_adc_response(resp_b)
             
-            # Format values with metric notation
-            if val_a is not None:
-                func_a = self.cb_func_A.currentText()
-                unit_a = self.get_unit_for_function(func_a)
-                display_a = self.format_with_metric_prefix(float(val_a), unit_a)
+            # Display Channel A only if enabled
+            if self.chk_enable_A.isChecked():
+                if val_a is not None:
+                    func_a = self.cb_func_A.currentText()
+                    unit_a = self.get_unit_for_function(func_a)
+                    display_a = self.format_with_metric_prefix(float(val_a), unit_a)
+                else:
+                    display_a = "OL"
+                self.lbl_a.setText(display_a)
             else:
-                display_a = "OL"
+                self.lbl_a.setText("--")
             
-            if val_b is not None:
-                func_b = self.cb_func_B.currentText()
-                unit_b = self.get_unit_for_function(func_b)
-                display_b = self.format_with_metric_prefix(float(val_b), unit_b)
+            # Display Channel B only if enabled
+            if self.chk_enable_B.isChecked():
+                if val_b is not None:
+                    func_b = self.cb_func_B.currentText()
+                    unit_b = self.get_unit_for_function(func_b)
+                    display_b = self.format_with_metric_prefix(float(val_b), unit_b)
+                else:
+                    display_b = "OL"
+                self.lbl_b.setText(display_b)
             else:
-                display_b = "OL"
-            
-            self.lcd_a.display(display_a)
-            self.lcd_b.display(display_b)
+                self.lbl_b.setText("--")
             
             if val_a is not None and val_b is not None:
                 self.gl_plot.update_readings(float(val_a), float(val_b))
                 self.update_statistics()
                 
         except Exception as e:
-            self.statusBar().showMessage(f"Read Error: {e}")
+            self.log_console(f"Read Error: {e}", "err")
             self.poll_timer.stop()
             self.chk_cont.setChecked(False)
 
