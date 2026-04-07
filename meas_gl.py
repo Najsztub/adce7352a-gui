@@ -56,6 +56,107 @@ ADC_TRIGS = {"IMM": "TRS0", "MAN": "TRS1", "EXT": "TRS2", "BUS": "TRS3"}
 DIGITS_CMD  = ["RE3", "RE4", "RE5"]
 DIGITS_DISP = ["3½", "4½", "5½"]
 
+OVERLOAD_THRESHOLD = 9.9e+36
+
+SUB_LABELS = {
+    "_": "",     "O": " [OL]",    "H": " [HI]",  "P": " [PASS]",
+    "L": " [LO]", "N": " [NULL]",  "S": " [SCALE]", "B": " [dB]",
+    "W": " [dBm]", "E": " [Err]",  "M": " [MAX]",  "I": " [MIN]",
+    "A": " [AVG]", "D": " [CALC2]",
+}
+
+HDR_LABELS = {
+    "DCV": "DC Volt", "ACV": "AC Volt", "ADV": "AC+DC Volt",
+    "R2W": "2W Res", "R2L": "LP-2W", "DCI": "DC Curr",
+    "ACI": "AC Curr", "ADI": "AC+DC Curr", "FRQ": "Freq",
+    "DOD": "Diode",  "RCT": "Cont",  "TC_": "Temp",
+    "BDV": "DC Volt B", "BDI": "DC Curr B", "BAI": "AC Curr B", "BCI": "AC+DC Curr B",
+}
+
+FUNCTIONS = {
+    "F1":  ("DCV  Ach",          "V",
+            [("Auto", "R0"), ("200 mV", "R3"), ("2 V", "R4"),
+             ("20 V", "R5"), ("200 V", "R6"), ("1000 V", "R7")], "DCV"),
+    "F2":  ("ACV  Ach",           "V",
+            [("Auto", "R0"), ("200 mV", "R3"), ("2 V", "R4"),
+             ("20 V", "R5"), ("200 V", "R6"), ("700 V", "R7")], "ACV"),
+    "F7":  ("ACV AC+DC  Ach",     "V",
+            [("Auto", "R0"), ("200 mV", "R3"), ("2 V", "R4"),
+             ("20 V", "R5"), ("200 V", "R6"), ("700 V", "R7")], "ADV"),
+    "F3":  ("2W Ω  Ach",          "Ω",
+            [("Auto", "R0"), ("200 Ω", "R3"), ("2 kΩ", "R4"), ("20 kΩ", "R5"),
+             ("200 kΩ", "R6"), ("2 MΩ", "R7"), ("20 MΩ", "R8"), ("200 MΩ", "R9")], "R2W"),
+    "F20": ("LP-2W Ω  Ach",       "Ω",
+            [("Auto", "R0"), ("200 Ω", "R3"), ("2 kΩ", "R4"), ("20 kΩ", "R5"),
+             ("200 kΩ", "R6"), ("2 MΩ", "R7"), ("20 MΩ", "R8")], "R2L"),
+    "F5":  ("DCI  Ach",           "A",
+            [("Auto", "R0"), ("2000 nA", "R1"), ("20 µA", "R2"), ("200 µA", "R3"),
+             ("2 mA", "R4"), ("20 mA", "R5"), ("200 mA", "R6"), ("2000 mA", "R7")], "DCI"),
+    "F6":  ("ACI  Ach",           "A",
+            [("Auto", "R0"), ("200 µA", "R3"), ("2 mA", "R4"),
+             ("20 mA", "R5"), ("200 mA", "R6"), ("2000 mA", "R7")], "ACI"),
+    "F8":  ("ACI AC+DC  Ach",     "A",
+            [("Auto", "R0"), ("200 µA", "R3"), ("2 mA", "R4"),
+             ("20 mA", "R5"), ("200 mA", "R6"), ("2000 mA", "R7")], "ADI"),
+    "F50": ("FREQ  Ach",          "Hz", [("Auto", "R0")], "FRQ"),
+    "F13": ("DIODE  Ach",         "V",  [("—", "")],      "DOD"),
+    "F22": ("CONT  Ach",          "Ω",  [("—", "")],      "RCT"),
+    "F40": ("TEMP",               "°C", [("—", "")],      "TC_"),
+    "F12": ("DCV  Bch",           "V",
+            [("Auto", "R0"), ("200 mV", "R3"), ("2 V", "R4"),
+             ("20 V", "R5"), ("200 V", "R6")], "BDV"),
+    "F35": ("DCI  Bch",           "A",  [("10 A", "R8")], "BDI"),
+    "F36": ("ACI  Bch",           "A",  [("10 A", "R8")], "BAI"),
+    "F37": ("ACI AC+DC  Bch",     "A",  [("10 A", "R8")], "BCI"),
+}
+
+
+# =============================================================================
+# Response parser (§6.6.2)
+# Header ON (H1):  "DCV_  +3.29860E+00"   or  "DCV_  -0.00123E+00"
+# Header OFF (H0): "+3.29860E+00"
+# Overload:        9.99999E+37
+# =============================================================================
+_HDR_RE = re.compile(r'^([A-Z0-9_]{3})([A-Z_])\s+([-+]?\d[\d.]*E[+-]\d+)\s*$')
+_NUM_RE = re.compile(r'^([-+]?\d[\d.]*E[+-]\d+)')
+
+def _cur_fkey(func_label):
+    for k, v in FUNCTIONS.items():
+        if v[0] == func_label:
+            return k
+    return "F1"
+
+def _si_fmt(val, unit):
+    if val == 0:
+        return f"0.000 {unit}"
+    a = abs(val)
+    for scale, pfx in [(1e12,"T"),(1e9,"G"),(1e6,"M"),(1e3,"k"),
+                       (1,""),(1e-3,"m"),(1e-6,"µ"),(1e-9,"n"),(1e-12,"p")]:
+        if a >= scale * 0.9999:
+            return f"{val/scale:.5g} {pfx}{unit}"
+    return f"{val:.5E} {unit}"
+
+def parse_adc_response(raw, func_key="F1"):
+    """Returns (value, main_hdr, sub_hdr, is_overload, display_str, desc_str)."""
+    raw = raw.strip()
+    main_h, sub_h = "", "_"
+    m = _HDR_RE.match(raw)
+    if m:
+        main_h = m.group(1)
+        sub_h  = m.group(2)
+        num_s  = m.group(3)
+    else:
+        nm = _NUM_RE.match(raw)
+        num_s = nm.group(1) if nm else raw
+    try:
+        val = float(num_s)
+    except ValueError:
+        return 0.0, main_h, sub_h, False, raw, raw
+    is_ol = val >= OVERLOAD_THRESHOLD
+    unit  = FUNCTIONS.get(func_key, ("", "V", "", "DCV"))[1]
+    disp  = "OVERLOAD" if is_ol else _si_fmt(val, unit)
+    desc  = HDR_LABELS.get(main_h, main_h) + SUB_LABELS.get(sub_h, f" [{sub_h}]")
+    return val, main_h, sub_h, is_ol, disp, desc
 
 # =============================================================================
 # OPENGL LIVE PLOT WIDGET
@@ -1023,6 +1124,8 @@ class ADCMT7352GUI(QMainWindow):
             self.send_cmd(f"DSP2,{ADC_RATES[self.cb_rate_B.currentText()]}")
             self.send_cmd(f"DSP2,{ADC_TRIGS[self.cb_trig_B.currentText()]}")
             self.send_cmd(f"DSP2,{DIGITS_CMD[self.cb_digits.currentIndex()]}")
+        else: 
+            self.send_cmd("DP0")  # Disable second display if Channel B is not enabled
         
         self.log_console("Settings applied.", "ok")
 
@@ -1036,55 +1139,35 @@ class ADCMT7352GUI(QMainWindow):
     def poll_readings(self):
         if not self.inst: return
         try:
-            # Update plot channel enable status
             self.gl_plot.set_channel_enabled("A", self.chk_enable_A.isChecked())
             self.gl_plot.set_channel_enabled("B", self.chk_enable_B.isChecked())
             
-            # Query both displays. ADC format: S±DD...DDE±DD,
             resp_a = self.inst.query("DSP1,MD?").strip()
             resp_b = self.inst.query("DSP2,MD?").strip()
             
-            val_a = self.parse_adc_response(resp_a)
-            val_b = self.parse_adc_response(resp_b)
+            fk_a = _cur_fkey(self.cb_func_A.currentText())
+            fk_b = _cur_fkey(self.cb_func_B.currentText())
+            val_a, main_h_a, sub_h_a, is_ol_a, disp_a, desc_a = parse_adc_response(resp_a, fk_a)
+            val_b, main_h_b, sub_h_b, is_ol_b, disp_b, desc_b = parse_adc_response(resp_b, fk_b)
             
-            # Display Channel A only if enabled
             if self.chk_enable_A.isChecked():
-                if val_a is not None:
-                    func_a = self.cb_func_A.currentText()
-                    unit_a = self.get_unit_for_function(func_a)
-                    display_a = self.format_with_metric_prefix(float(val_a), unit_a)
-                else:
-                    display_a = "OL"
-                self.lbl_a.setText(display_a)
+                self.lbl_a.setText(disp_a)
             else:
                 self.lbl_a.setText("--")
             
-            # Display Channel B only if enabled
             if self.chk_enable_B.isChecked():
-                if val_b is not None:
-                    func_b = self.cb_func_B.currentText()
-                    unit_b = self.get_unit_for_function(func_b)
-                    display_b = self.format_with_metric_prefix(float(val_b), unit_b)
-                else:
-                    display_b = "OL"
-                self.lbl_b.setText(display_b)
+                self.lbl_b.setText(disp_b)
             else:
                 self.lbl_b.setText("--")
             
-            if val_a is not None and val_b is not None:
-                self.gl_plot.update_readings(float(val_a), float(val_b))
-                self.update_statistics()
+            self.gl_plot.update_readings(val_a if not is_ol_a else OVERLOAD_THRESHOLD * 1.1,
+                                         val_b if not is_ol_b else OVERLOAD_THRESHOLD * 1.1)
+            self.update_statistics()
                 
         except Exception as e:
             self.log_console(f"Read Error: {e}", "err")
             self.poll_timer.stop()
             self.chk_cont.setChecked(False)
-
-    @staticmethod
-    def parse_adc_response(resp):
-        # Extract scientific notation floats: e.g., S+1.23456E+00,
-        matches = re.findall(r'[-+]?\d*\.\d+[eE][-+]?\d+', resp)
-        return matches[0] if matches else None
 
 # =============================================================================
 # ENTRY POINT

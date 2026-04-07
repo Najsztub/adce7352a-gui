@@ -36,4 +36,4 @@ class MockDMMDevice:
     
     def close(self):
         """Simulate device close."""
-        passmo
+        pass
