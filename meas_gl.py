@@ -14,6 +14,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout
 from OpenGL.GL import *
 from OpenGL.GL import GL_TEXTURE_2D
 
+from mock import MockDMMDevice
+
 # =============================================================================
 # ADC COMMAND MAPPINGS (Based on Manual Section 6.6.3)
 # =============================================================================
@@ -50,45 +52,10 @@ ADC_RANGES = {"AUTO": "R0", "R1": "R1", "R2": "R2", "R3": "R3",
 ADC_RATES = {"FAST": "PR1", "MED": "PR2", "SLOW1": "PR3", "SLOW2": "PR4"}
 ADC_TRIGS = {"IMM": "TRS0", "MAN": "TRS1", "EXT": "TRS2", "BUS": "TRS3"}
 
-# =============================================================================
-# MOCK DEVICE CLASS FOR TESTING
-# =============================================================================
-class MockDMMDevice:
-    """Simulates ADCMT 7352A responses for GUI testing without hardware."""
-    def __init__(self):
-        self.current_func_a = "F1"
-        self.current_func_b = "F12"
-        self.value_a = 0.5
-        self.value_b = 0.3
-        self.timeout = 2000
-    
-    def query(self, cmd):
-        """Simulate device query responses."""
-        import random
-        # Add realistic variation to readings
-        noise_a = random.gauss(0, 0.02)
-        noise_b = random.gauss(0, 0.01)
-        self.value_a = np.clip(self.value_a + noise_a, -10, 10)
-        self.value_b = np.clip(self.value_b + noise_b, -5, 5)
-        
-        if "DSP1,MD?" in cmd:
-            exp_a = f"{self.value_a:.5e}".replace('e', 'E')
-            return f"S{exp_a},"
-        elif "DSP2,MD?" in cmd:
-            exp_b = f"{self.value_b:.5e}".replace('e', 'E')
-            return f"S{exp_b},"
-        return "S+0.00000E+00,"
-    
-    def write(self, cmd):
-        """Simulate device command execution."""
-        if "DSP1" in cmd and "F" in cmd:
-            self.current_func_a = cmd.split(",")[1]
-        elif "DSP2" in cmd and "F" in cmd:
-            self.current_func_b = cmd.split(",")[1]
-    
-    def close(self):
-        """Simulate device close."""
-        pass
+# Digits  RE3..RE5  (§6.6.3)
+DIGITS_CMD  = ["RE3", "RE4", "RE5"]
+DIGITS_DISP = ["3½", "4½", "5½"]
+
 
 # =============================================================================
 # OPENGL LIVE PLOT WIDGET
@@ -239,7 +206,9 @@ class DMMGLPlot(QOpenGLWidget):
                 x_norm = (x / 200.0) * (w - left_margin) + left_margin
                 y_norm = h - bottom_margin - ((y - self.min_val) / (self.max_val - self.min_val)) * (h - bottom_margin)
                 if 0 <= x_norm < w and 0 <= y_norm < h:
-                    painter.drawText(int(x_norm) + 5, int(y_norm) - 10, text)
+                    # Show both annotation text and value
+                    value_text = f"{text}: {y:.6g}"
+                    painter.drawText(int(x_norm) + 5, int(y_norm) - 10, value_text)
         
         painter.end()
     
@@ -329,10 +298,10 @@ class ADCMT7352GUI(QMainWindow):
         self.poll_timer.timeout.connect(self.poll_readings)
         self.is_continuous = False
         self.use_mock = False
-
+        self.default_digits = 2  # 4½ digits (RE4)
         self.init_ui()
         self.statusBar().showMessage("Ready. Select device and click Connect.")
-
+        
     def init_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -417,6 +386,9 @@ class ADCMT7352GUI(QMainWindow):
         # Channel A configuration card
         layout.addWidget(self.create_channel_card("Channel A (DSP1)", "A"))
         
+        # Digits selection card
+        layout.addWidget(self.create_digits_card())
+        
         # Channel B configuration card  
         layout.addWidget(self.create_channel_card("Channel B (DSP2)", "B"))
 
@@ -451,7 +423,7 @@ class ADCMT7352GUI(QMainWindow):
         # Resource string
         res_layout = QHBoxLayout()
         res_layout.addWidget(QLabel("Resource:"))
-        self.res_input = QLineEdit("USB0::0x0B21::0x0001::12345678::INSTR")
+        self.res_input = QLineEdit("TCPIP0::10.1.1.138::5025::SOCKET")
         self.res_input.setPlaceholderText("VISA Resource String")
         res_layout.addWidget(self.res_input, 1)
         layout.addLayout(res_layout)
@@ -523,6 +495,28 @@ class ADCMT7352GUI(QMainWindow):
         setattr(self, f"cb_trig_{channel}", cb_trig)
         trig_layout.addWidget(cb_trig)
         layout.addLayout(trig_layout)
+
+        return group
+
+    def create_digits_card(self):
+        """Create the digits selection card."""
+        group = QGroupBox("DIGITS")
+        group.setStyleSheet("""
+            QGroupBox { border: 1px solid #30363d; border-radius: 4px; margin-top: 12px; padding-top: 8px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #58a6ff; font-weight: bold; }
+        """)
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(10, 12, 10, 10)
+
+        # Digits selection
+        digits_layout = QHBoxLayout()
+        digits_layout.addWidget(QLabel("Digits:"))
+        cb_digits = QComboBox()
+        cb_digits.addItems(DIGITS_DISP)
+        cb_digits.setCurrentIndex(self.default_digits)
+        self.cb_digits = cb_digits
+        digits_layout.addWidget(cb_digits)
+        layout.addLayout(digits_layout)
 
         return group
 
@@ -980,11 +974,12 @@ class ADCMT7352GUI(QMainWindow):
                 self.send_cmd("DE1")     # Enable dual display
                 self.send_cmd("DSP1,F1") # Default DCV-Ach
                 self.send_cmd("DSP2,F12")# Default DCV-Bch
-                
+                self.send_cmd(f"DSP1,{DIGITS_CMD[self.default_digits]}")
+                self.send_cmd(f"DSP2,{DIGITS_CMD[self.default_digits]}")
                 self.btn_connect.setText("Disconnect")
                 self._update_status(True)
                 self.log_console(f"Connected to {self.res_input.text()}", "ok")
-            
+                
             self.apply_settings()
         except Exception as e:
             QMessageBox.critical(self, "Connection Error", str(e))
@@ -1019,6 +1014,7 @@ class ADCMT7352GUI(QMainWindow):
             self.send_cmd(f"DSP1,{ADC_RANGES[self.cb_rng_A.currentText()]}")
             self.send_cmd(f"DSP1,{ADC_RATES[self.cb_rate_A.currentText()]}")
             self.send_cmd(f"DSP1,{ADC_TRIGS[self.cb_trig_A.currentText()]}")
+            self.send_cmd(f"DSP1,{DIGITS_CMD[self.cb_digits.currentIndex()]}")
         
         if self.chk_enable_B.isChecked():
             func_b = self.cb_func_B.currentText()
@@ -1026,6 +1022,7 @@ class ADCMT7352GUI(QMainWindow):
             self.send_cmd(f"DSP2,{ADC_RANGES[self.cb_rng_B.currentText()]}")
             self.send_cmd(f"DSP2,{ADC_RATES[self.cb_rate_B.currentText()]}")
             self.send_cmd(f"DSP2,{ADC_TRIGS[self.cb_trig_B.currentText()]}")
+            self.send_cmd(f"DSP2,{DIGITS_CMD[self.cb_digits.currentIndex()]}")
         
         self.log_console("Settings applied.", "ok")
 
