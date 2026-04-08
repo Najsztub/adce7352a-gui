@@ -515,31 +515,36 @@ class DMMGLPlot(QOpenGLWidget):
 
     def _draw_channel(self, data, color, x_min, x_max):
         r, g, b = color
-        n = len(self.times) if self.times else len(data)
+        n = len(self.times) if self.times else 0
         if n == 0:
             return
         
-        # Map data indices to time values
-        time_vals = self.times if self.times else list(range(len(data)))
+        # times list contains the last n timestamps, corresponding to the last n elements of data
+        # Data is rolled so newest value is at data[-1], oldest at data[-n]
         
         # Fill under curve
         if self.show_fill:
             glColor4f(r, g, b, 0.10)
             glBegin(GL_TRIANGLE_STRIP)
-            for i, val in enumerate(data):
-                if i < len(time_vals):
-                    t = time_vals[i]
-                    v = val if np.isfinite(val) else self.y_min
-                    glVertex2f(t, self.y_min)
-                    glVertex2f(t, v)
+            # Iterate backwards - newest data is at end
+            for j in range(n):
+                i = len(data) - n + j  # data index
+                val = data[i]
+                t = self.times[j]
+                v = val if np.isfinite(val) else self.y_min
+                glVertex2f(t, self.y_min)
+                glVertex2f(t, v)
             glEnd()
+        
         # Line
         glColor4f(r, g, b, 1.0)
         glLineWidth(self.line_width)
         glBegin(GL_LINE_STRIP)
-        for i, val in enumerate(data):
-            if i < len(time_vals) and np.isfinite(val):
-                t = time_vals[i]
+        for j in range(n):
+            i = len(data) - n + j
+            val = data[i]
+            if np.isfinite(val):
+                t = self.times[j]
                 glVertex2f(t, val)
             else:
                 glEnd(); glBegin(GL_LINE_STRIP)   # break on NaN
