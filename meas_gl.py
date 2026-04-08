@@ -422,12 +422,14 @@ class DMMGLPlot(QOpenGLWidget):
         self.y_min = cy - hy + self.pan_y
         self.y_max = cy + hy + self.pan_y
         
-        # X axis - apply zoom centered on visible window
+        # X axis - apply zoom centered on auto-scaled range
         if self.times:
             x_span = self._x_max_auto - self._x_min_auto
             if x_span > 0:
+                # Calculate visible width based on zoom
                 vis_w = x_span / self.zoom_x
-                cx = (self.x_min + self.x_max) / 2
+                # Center on the auto-scaled range
+                cx = (self._x_min_auto + self._x_max_auto) / 2
                 self.x_min = cx - vis_w / 2
                 self.x_max = cx + vis_w / 2
 
@@ -590,7 +592,6 @@ class DMMGLPlot(QOpenGLWidget):
         painter.setRenderHint(QPainter.TextAntialiasing)
 
         px, py, pw, ph = self._plot_rect()
-        n_vis = self._visible_samples()
         x_span = self.x_max - self.x_min if self.x_max != self.x_min else 1.0
         y_span = self.y_max - self.y_min if self.y_max != self.y_min else 1.0
 
