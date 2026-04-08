@@ -267,3 +267,7 @@ class MockDMMDevice:
 
     def close(self):
         pass
+
+    def read(self):
+        """Simulate bare read - return a measurement for DSP1."""
+        return self._handle_measurement("DSP1?")

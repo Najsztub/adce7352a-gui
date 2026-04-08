@@ -1,6 +1,7 @@
 import sys
 import re
 import csv
+import time
 import pyvisa
 import numpy as np
 from datetime import datetime
@@ -21,8 +22,26 @@ from OpenGL.GL import *
 from mock import MockDMMDevice
 
 # =============================================================================
-# ADC COMMAND MAPPINGS  (Based on Manual Section 6.6.3)
+# COLLAPSIBLE GROUP BOX WIDGET
 # =============================================================================
+class CollapsibleSection(QGroupBox):
+    """Collapsible group box with built-in toggle from title click."""
+    
+    def __init__(self, title="", parent=None):
+        super().__init__(title, parent)
+        self.setCheckable(True)
+        self.setChecked(True)
+        self._toggle_style()
+        self.toggled.connect(self._toggle_style)
+        
+    def _toggle_style(self):
+        """Update title with collapse/expand indicator."""
+        state = "▼" if self.isChecked() else "▶"
+        orig_title = self.title().rstrip(" ▼▶ ")
+        self.setTitle(f"{orig_title} {state}")
+
+# =============================================================================
+
 ADC_FUNCS = {
     "DCV-Ach": "F1", "ACV-Ach": "F2", "2WΩ-Ach": "F3", "DCI-Ach": "F5",
     "ACI-Ach": "F6", "ACV+DC-Ach": "F7", "ACI+DC-Ach": "F8",
@@ -188,20 +207,29 @@ class DMMGLPlot(QOpenGLWidget):
         self.buf_size = 200
         self.data_a   = np.full(self.buf_size, np.nan)
         self.data_b   = np.full(self.buf_size, np.nan)
-        self.timestamps: list[datetime] = []   # one per push
+        self.times: list[float] = []   # elapsed seconds from start
+        self._t0: float | None = None  # capture start time
 
         # ── view limits ───────────────────────────────────────────────
         self.y_min = -1.0
         self.y_max =  1.0
         self._y_min_auto = -1.0
         self._y_max_auto =  1.0
-        self.x_offset = 0      # first visible sample index (for X-pan)
+        
+        # X-axis (time-based)
+        self.x_min = 0.0
+        self.x_max = 10.0
+        self._x_min_auto = 0.0
+        self._x_max_auto = 10.0
+        self._x_auto_scale = True  # auto-extend X as new data arrives
+        self.x_visible_width = None  # if set, limit visible window
 
         # ── zoom / pan ────────────────────────────────────────────────
         self.zoom_y   = 1.0    # Y zoom factor (>1 = zoomed in)
         self.pan_y    = 0.0    # Y pan offset in data units
         self.zoom_x   = 1.0    # X zoom factor
         self._pan_origin: QPoint | None = None
+        self._pan_x0    = 0.0
         self._pan_y0    = 0.0
 
         # ── channel visibility ────────────────────────────────────────
@@ -246,24 +274,25 @@ class DMMGLPlot(QOpenGLWidget):
         return self.ML, self.MT, w - self.ML - self.MR, h - self.MT - self.MB
 
     def _screen_to_data(self, sx, sy):
-        """Convert screen pixel → (sample_index_float, data_value_float)."""
+        """Convert screen pixel → (time_sec_float, data_value_float)."""
         px, py, pw, ph = self._plot_rect()
-        n = self._visible_samples()
-        xi = ((sx - px) / pw) * n
+        x_range = self.x_max - self.x_min
+        xi = self.x_min + ((sx - px) / pw) * x_range if x_range > 0 else self.x_min
         yv = self.y_min + (1.0 - (sy - py) / ph) * (self.y_max - self.y_min)
         return xi, yv
 
     def _data_to_screen(self, xi, yv):
-        """Convert (sample_index, data_value) → screen pixel (sx, sy)."""
+        """Convert (time_sec, data_value) → screen pixel (sx, sy)."""
         px, py, pw, ph = self._plot_rect()
-        n = self._visible_samples()
-        sx = px + (xi / n) * pw
+        x_range = self.x_max - self.x_min
+        sx = px + ((xi - self.x_min) / x_range) * pw if x_range > 0 else px
         sy = py + ph * (1.0 - (yv - self.y_min) / (self.y_max - self.y_min))
         return sx, sy
 
-    def _visible_samples(self):
-        """Number of samples currently visible (respects X-zoom)."""
-        return max(1, int(self.buf_size / self.zoom_x))
+    def _visible_time_range(self):
+        """Visible time range in seconds."""
+        w = (self.x_max - self.x_min) / self.zoom_x if self.zoom_x > 0 else (self.x_max - self.x_min)
+        return max(0.1, w)
 
     # ------------------------------------------------------------------ #
     #  public API
@@ -273,7 +302,11 @@ class DMMGLPlot(QOpenGLWidget):
         self.data_a = np.full(n, np.nan)
         self.data_b = np.full(n, np.nan)
         self.buf_size = n
-        self.timestamps.clear()
+        self.times.clear()
+        self._t0 = None
+        self._x_min_auto = 0.0
+        self._x_max_auto = 10.0
+        self.x_min, self.x_max = 0.0, 10.0
         self.update()
 
     def set_channel_enabled(self, channel, enabled):
@@ -281,12 +314,35 @@ class DMMGLPlot(QOpenGLWidget):
         else:              self.enable_b = enabled
         self.update()
 
-    def update_readings(self, val_a, val_b):
-        self.data_a = np.roll(self.data_a, -1); self.data_a[-1] = val_a
-        self.data_b = np.roll(self.data_b, -1); self.data_b[-1] = val_b
-        self.timestamps.append(datetime.now())
-        if len(self.timestamps) > self.buf_size:
-            self.timestamps = self.timestamps[-self.buf_size:]
+    def update_readings(self, val_a, val_b, timestamp: float | None = None):
+        """Update with new readings. timestamp is elapsed seconds from capture start."""
+        if self._t0 is None:
+            self._t0 = time.time()
+        if timestamp is None:
+            timestamp = time.time() - self._t0
+        
+        # Shift existing data to make room for new point (rolling window)
+        self.data_a = np.roll(self.data_a, -1)
+        self.data_b = np.roll(self.data_b, -1)
+        self.data_a[-1] = val_a
+        self.data_b[-1] = val_b
+        
+        # Track times for X axis
+        self.times.append(timestamp)
+        if len(self.times) > self.buf_size:
+            self.times = self.times[-self.buf_size:]
+        
+        # Auto-scale X axis: extend to show all data left-to-right
+        if self._x_auto_scale and self.times:
+            self._x_min_auto = self.times[0]
+            self._x_max_auto = self.times[-1]
+            # Apply zoom to visible window
+            if self.x_visible_width:
+                self.x_max = self.x_min + self.x_visible_width
+            else:
+                self.x_max = self._x_max_auto + 1  # small margin
+            self.x_min = self._x_min_auto
+        
         self._recalc_auto_range()
         self._apply_zoom_pan()
         self.update()
@@ -295,13 +351,37 @@ class DMMGLPlot(QOpenGLWidget):
         self.zoom_y = 1.0
         self.zoom_x = 1.0
         self.pan_y  = 0.0
+        self.x_visible_width = None
+        if self._x_auto_scale and self.times:
+            self.x_min = self._x_min_auto
+            self.x_max = self._x_max_auto
         self._apply_zoom_pan()
+        self.update()
+
+    def set_auto_scale_x(self, enabled: bool):
+        """Enable/disable X-axis auto-scaling."""
+        self._x_auto_scale = enabled
+        if enabled:
+            self.reset_zoom()
+
+    def set_visible_time_window(self, seconds: float | None):
+        """Set visible time window width in seconds. None = show all."""
+        self.x_visible_width = seconds
+        if self._x_auto_scale and self.times:
+            if seconds:
+                self.x_max = self.x_min + seconds
+            else:
+                self.x_max = self._x_max_auto
         self.update()
 
     def clear_data(self):
         self.data_a[:] = np.nan
         self.data_b[:] = np.nan
-        self.timestamps.clear()
+        self.times.clear()
+        self._t0 = None
+        self._x_min_auto = 0.0
+        self._x_max_auto = 10.0
+        self.x_min, self.x_max = 0.0, 10.0
         self.marker1 = None
         self.marker2 = None
         if self.marker_callback: self.marker_callback()
@@ -336,10 +416,20 @@ class DMMGLPlot(QOpenGLWidget):
         self._y_max_auto = mx + mg
 
     def _apply_zoom_pan(self):
+        # Y axis
         cy = (self._y_min_auto + self._y_max_auto) / 2
         hy = (self._y_max_auto - self._y_min_auto) / 2 / self.zoom_y
         self.y_min = cy - hy + self.pan_y
         self.y_max = cy + hy + self.pan_y
+        
+        # X axis - apply zoom centered on visible window
+        if self.times:
+            x_span = self._x_max_auto - self._x_min_auto
+            if x_span > 0:
+                vis_w = x_span / self.zoom_x
+                cx = (self.x_min + self.x_max) / 2
+                self.x_min = cx - vis_w / 2
+                self.x_max = cx + vis_w / 2
 
     # ------------------------------------------------------------------ #
     #  GL  initialisation / resize
@@ -362,115 +452,133 @@ class DMMGLPlot(QOpenGLWidget):
         glClear(GL_COLOR_BUFFER_BIT)
         w, h = self.width(), self.height()
         px, py, pw, ph = self._plot_rect()
-        n_vis = self._visible_samples()
-
-        # Ortho projection mapped to inner plot rect
+        
+        # Use visible time range for X axis
+        x_min, x_max = self.x_min, self.x_max
+        if x_max <= x_min:
+            x_min, x_max = 0.0, 10.0
+        
+        # Ortho projection mapped to inner plot rect (time-based X)
         glMatrixMode(GL_PROJECTION)
         glLoadIdentity()
-        # map: x in [0..n_vis], y in [y_min..y_max]
-        glOrtho(0, n_vis, self.y_min, self.y_max, -1, 1)
+        glOrtho(x_min, x_max, self.y_min, self.y_max, -1, 1)
         # Apply viewport clip to inner rect only
         glViewport(px, h - py - ph, pw, ph)
         glMatrixMode(GL_MODELVIEW)
         glLoadIdentity()
 
         if self.show_grid:
-            self._draw_grid(n_vis)
-        self._draw_zero_line()
-        if self.enable_a: self._draw_channel(self.data_a, CLR_CH_A, n_vis)
-        if self.enable_b: self._draw_channel(self.data_b, CLR_CH_B, n_vis)
-        if self.enable_annotations: self._draw_annotation_lines(n_vis)
-        self._draw_markers(n_vis)
+            self._draw_grid(x_min, x_max)
+        self._draw_zero_line(x_min, x_max)
+        if self.enable_a: self._draw_channel(self.data_a, CLR_CH_A, x_min, x_max)
+        if self.enable_b: self._draw_channel(self.data_b, CLR_CH_B, x_min, x_max)
+        if self.enable_annotations: self._draw_annotation_lines(x_min, x_max)
+        self._draw_markers(x_min, x_max)
 
         # Restore full viewport for QPainter overlay
         glViewport(0, 0, w, h)
         self._draw_overlay_painter()
 
-    def _draw_grid(self, n_vis):
+    def _draw_grid(self, x_min, x_max):
         r, g, b = CLR_GRID
         glColor4f(r, g, b, 1.0)
         glLineWidth(1.0)
         glBegin(GL_LINES)
-        # Vertical grid lines
-        step_x = max(1, n_vis // 10)
-        for x in range(0, n_vis + 1, step_x):
+        # Vertical grid lines (time in seconds)
+        span = x_max - x_min
+        step_x = span / 10 if span else 1
+        x = x_min
+        while x <= x_max + step_x * 0.01:
             glVertex2f(x, self.y_min)
             glVertex2f(x, self.y_max)
+            x += step_x
         # Horizontal grid lines (5 divisions)
-        span = self.y_max - self.y_min
-        step_y = span / 5 if span else 1
+        span_y = self.y_max - self.y_min
+        step_y = span_y / 5 if span_y else 1
         y = self.y_min
         while y <= self.y_max + step_y * 0.01:
-            glVertex2f(0, y)
-            glVertex2f(n_vis, y)
+            glVertex2f(x_min, y)
+            glVertex2f(x_max, y)
             y += step_y
         glEnd()
 
-    def _draw_zero_line(self):
+    def _draw_zero_line(self, x_min, x_max):
         if self.y_min < 0 < self.y_max:
             r, g, b = CLR_ZERO
             glColor4f(r, g, b, 1.0)
             glLineWidth(1.5)
             glBegin(GL_LINES)
-            glVertex2f(0, 0); glVertex2f(self._visible_samples(), 0)
+            glVertex2f(x_min, 0); glVertex2f(x_max, 0)
             glEnd()
 
-    def _draw_channel(self, data, color, n_vis):
+    def _draw_channel(self, data, color, x_min, x_max):
         r, g, b = color
+        n = len(self.times) if self.times else len(data)
+        if n == 0:
+            return
+        
+        # Map data indices to time values
+        time_vals = self.times if self.times else list(range(len(data)))
+        
         # Fill under curve
         if self.show_fill:
             glColor4f(r, g, b, 0.10)
             glBegin(GL_TRIANGLE_STRIP)
-            n = len(data)
-            for i in range(n):
-                xi = i * n_vis / n
-                v  = data[i] if np.isfinite(data[i]) else self.y_min
-                glVertex2f(xi, self.y_min)
-                glVertex2f(xi, v)
+            for i, val in enumerate(data):
+                if i < len(time_vals):
+                    t = time_vals[i]
+                    v = val if np.isfinite(val) else self.y_min
+                    glVertex2f(t, self.y_min)
+                    glVertex2f(t, v)
             glEnd()
         # Line
         glColor4f(r, g, b, 1.0)
         glLineWidth(self.line_width)
         glBegin(GL_LINE_STRIP)
-        n = len(data)
         for i, val in enumerate(data):
-            if np.isfinite(val):
-                xi = i * n_vis / n
-                glVertex2f(xi, val)
+            if i < len(time_vals) and np.isfinite(val):
+                t = time_vals[i]
+                glVertex2f(t, val)
             else:
                 glEnd(); glBegin(GL_LINE_STRIP)   # break on NaN
         glEnd()
 
-    def _draw_annotation_lines(self, n_vis):
-        n = len(self.data_a)
+    def _draw_annotation_lines(self, x_min, x_max):
+        n = len(self.times) if self.times else len(self.data_a)
+        if n == 0:
+            return
+        time_vals = self.times if self.times else list(range(n))
         glLineWidth(1.0)
         for x, y, text, color in self.annotations:
             glColor4f(*color, 0.8)
-            xi = x * n_vis / n
-            glBegin(GL_LINES)
-            glVertex2f(xi, self.y_min); glVertex2f(xi, self.y_max)
-            glEnd()
-            glPointSize(7.0)
-            glBegin(GL_POINTS)
-            glVertex2f(xi, y)
-            glEnd()
+            if x < len(time_vals):
+                xi = time_vals[int(x)]
+                glBegin(GL_LINES)
+                glVertex2f(xi, self.y_min); glVertex2f(xi, self.y_max)
+                glEnd()
+                glPointSize(7.0)
+                glBegin(GL_POINTS)
+                glVertex2f(xi, y)
+                glEnd()
 
-    def _draw_markers(self, n_vis):
-        n = len(self.data_a)
+    def _draw_markers(self, x_min, x_max):
+        n = len(self.times) if self.times else len(self.data_a)
+        if n == 0:
+            return
+        time_vals = self.times if self.times else list(range(n))
         for marker, color in [(self.marker1, CLR_M1), (self.marker2, CLR_M2)]:
             if marker is None: continue
-            mx, my = marker
-            xi = mx * n_vis / n
+            mx, my = marker  # now stores time, not index
             r, g, b = color
             glColor4f(r, g, b, 0.9)
             glLineWidth(1.5)
             glEnable(0x0B10)  # GL_LINE_STIPPLE – skip if unsupported
             glBegin(GL_LINES)
-            glVertex2f(xi, self.y_min); glVertex2f(xi, self.y_max)
+            glVertex2f(mx, self.y_min); glVertex2f(mx, self.y_max)
             glEnd()
             glPointSize(10.0)
             glBegin(GL_POINTS)
-            glVertex2f(xi, my)
+            glVertex2f(mx, my)
             glEnd()
 
     # ------------------------------------------------------------------ #
@@ -483,7 +591,8 @@ class DMMGLPlot(QOpenGLWidget):
 
         px, py, pw, ph = self._plot_rect()
         n_vis = self._visible_samples()
-        span  = self.y_max - self.y_min if self.y_max != self.y_min else 1.0
+        x_span = self.x_max - self.x_min if self.x_max != self.x_min else 1.0
+        y_span = self.y_max - self.y_min if self.y_max != self.y_min else 1.0
 
         # ── border rect ──────────────────────────────────────────────
         painter.setPen(QPen(QColor(48, 54, 61), 1))
@@ -495,27 +604,29 @@ class DMMGLPlot(QOpenGLWidget):
         fm = QFontMetrics(tick_font)
         painter.setPen(QColor(130, 140, 160))
         for i in range(6):
-            yv  = self.y_min + i * span / 5
+            yv  = self.y_min + i * y_span / 5
             sy  = py + ph * (1.0 - i / 5.0)
             lbl = _si_fmt(yv, self.y_unit) if self.y_unit else f"{yv:.4g}"
             tw  = fm.horizontalAdvance(lbl)
             painter.drawText(px - tw - 4, int(sy) + fm.ascent() // 2, lbl)
 
-        # ── X-axis tick labels ────────────────────────────────────────
-        n_ticks = min(10, n_vis)
-        step    = max(1, n_vis // n_ticks)
+        # ── X-axis tick labels (time in seconds) ────────────────────────
+        n_ticks = min(10, int(x_span))
+        step    = x_span / n_ticks if n_ticks else 1
         painter.setPen(QColor(100, 110, 125))
-        for xi in range(0, n_vis + 1, step):
-            sx  = px + int(xi / n_vis * pw)
-            lbl = str(xi)
-            tw  = fm.horizontalAdvance(lbl)
+        t = self.x_min
+        while t <= self.x_max + step * 0.01:
+            sx = px + int((t - self.x_min) / x_span * pw)
+            lbl = f"{t:.2f}s"
+            tw = fm.horizontalAdvance(lbl)
             painter.drawText(sx - tw // 2, py + ph + 16, lbl)
+            t += step
 
         # ── axis titles ───────────────────────────────────────────────
         ax_font = QFont("Consolas", 9, QFont.Bold)
         painter.setFont(ax_font)
         painter.setPen(QColor(170, 180, 195))
-        painter.drawText(px + pw // 2 - 30, py + ph + 28, self.x_label)
+        painter.drawText(px + pw // 2 - 30, py + ph + 28, "Time (s)")
         painter.save()
         painter.translate(12, py + ph // 2)
         painter.rotate(-90)
@@ -537,23 +648,24 @@ class DMMGLPlot(QOpenGLWidget):
             abox_font = QFont("Consolas", 8)
             painter.setFont(abox_font)
             afm = QFontMetrics(abox_font)
-            n = len(self.data_a)
+            time_vals = self.times if self.times else list(range(len(self.data_a)))
             for xi_idx, yv, text, color in self.annotations:
-                r, g, b = color
-                sx, sy = self._data_to_screen(xi_idx * n_vis / n, yv)
-                if not (px <= sx <= px + pw and py <= sy <= py + ph): continue
-                lbl = f"{text}: {_si_fmt(yv, self.y_unit)}"
-                tw, th = afm.horizontalAdvance(lbl), afm.height()
-                bx, by = int(sx) + 6, int(sy) - th - 4
-                # clamp to plot rect
-                bx = min(bx, px + pw - tw - 6)
-                painter.fillRect(bx - 2, by - 1, tw + 4, th + 2,
-                                 QColor(20, 22, 28, 200))
-                painter.setPen(QColor(int(r*255), int(g*255), int(b*255)))
-                painter.drawText(bx, by + afm.ascent(), lbl)
+                if xi_idx < len(time_vals):
+                    r, g, b = color
+                    t_val = time_vals[int(xi_idx)]
+                    sx, sy = self._data_to_screen(t_val, yv)
+                    if not (px <= sx <= px + pw and py <= sy <= py + ph): continue
+                    lbl = f"{text}: {_si_fmt(yv, self.y_unit)}"
+                    tw, th = afm.horizontalAdvance(lbl), afm.height()
+                    bx, by = int(sx) + 6, int(sy) - th - 4
+                    bx = min(bx, px + pw - tw - 6)
+                    painter.fillRect(bx - 2, by - 1, tw + 4, th + 2,
+                                     QColor(20, 22, 28, 200))
+                    painter.setPen(QColor(int(r*255), int(g*255), int(b*255)))
+                    painter.drawText(bx, by + afm.ascent(), lbl)
 
         # ── marker readouts ───────────────────────────────────────────
-        self._draw_marker_overlay(painter, px, py, pw, ph, n_vis)
+        self._draw_marker_overlay(painter, px, py, pw, ph)
 
         # ── crosshair ─────────────────────────────────────────────────
         if self.show_crosshair and self._mouse_pos is not None:
@@ -578,16 +690,17 @@ class DMMGLPlot(QOpenGLWidget):
 
         painter.end()
 
-    def _draw_marker_overlay(self, painter, px, py, pw, ph, n_vis):
-        n = len(self.data_a)
+    def _draw_marker_overlay(self, painter, px, py, pw, ph):
+        n = len(self.times) if self.times else len(self.data_a)
+        time_vals = self.times if self.times else list(range(n))
         mfont = QFont("Consolas", 8, QFont.Bold)
         painter.setFont(mfont)
         mfm = QFontMetrics(mfont)
 
         def draw_one(marker, label, bg_color: QColor, text_color: QColor, stack=0):
             if marker is None: return
-            mx_idx, mv = marker
-            sx, sy = self._data_to_screen(mx_idx * n_vis / n, mv)
+            mx_time, mv = marker  # now stores time in seconds, not index
+            sx, sy = self._data_to_screen(mx_time, mv)
             # vertical dashed line
             pen = QPen(text_color, 1, Qt.DashLine)
             painter.setPen(pen)
@@ -609,11 +722,11 @@ class DMMGLPlot(QOpenGLWidget):
         draw_one(self.marker1, "M1", QColor(60, 48, 0, 200),  QColor(255, 200, 0),  0)
         draw_one(self.marker2, "M2", QColor(60, 22, 10, 200), QColor(255, 110, 60), 1)
 
-        # delta between markers
+        # delta between markers (show time diff in seconds)
         if self.marker1 and self.marker2:
             delta = self.marker2[1] - self.marker1[1]
-            dx    = int(self.marker2[0] - self.marker1[0])
-            lbl   = f"Δ = {_si_fmt(delta, self.y_unit) if self.y_unit else f'{delta:.5g}'}  ({dx} smp)"
+            dt    = self.marker2[0] - self.marker1[0]
+            lbl   = f"Δ = {_si_fmt(delta, self.y_unit) if self.y_unit else f'{delta:.5g}'}  (Δt={dt:.2f}s)"
             dfont = QFont("Consolas", 8)
             painter.setFont(dfont)
             dfm = QFontMetrics(dfont)
@@ -631,9 +744,15 @@ class DMMGLPlot(QOpenGLWidget):
         self._mouse_pos = event.pos()
         if self._pan_origin is not None and (event.buttons() & Qt.MiddleButton):
             dy_px = event.pos().y() - self._pan_origin.y()
+            dx_px = event.pos().x() - self._pan_origin.x()
             px, py, pw, ph = self._plot_rect()
-            span = self.y_max - self.y_min
-            self.pan_y = self._pan_y0 - dy_px / ph * span
+            # Y pan
+            span_y = self.y_max - self.y_min
+            self.pan_y = self._pan_y0 - dy_px / ph * span_y
+            # X pan (in time units)
+            span_x = self.x_max - self.x_min
+            self.x_min = self._pan_x0 - dx_px / pw * span_x
+            self.x_max = self.x_min + span_x
             self._apply_zoom_pan()
         self.update()
 
@@ -641,27 +760,31 @@ class DMMGLPlot(QOpenGLWidget):
         px, py, pw, ph = self._plot_rect()
         if not (px <= event.x() <= px + pw and py <= event.y() <= py + ph):
             return
-        xi, yv = self._screen_to_data(event.x(), event.y())
-        n = len(self.data_a)
-        n_vis = self._visible_samples()
-        # Convert normalised xi to buffer index
-        buf_idx = int(xi * n / n_vis)
-        buf_idx = np.clip(buf_idx, 0, n - 1)
-        # Pick the actual value from the active channel at that index
-        if self.enable_a and np.isfinite(self.data_a[buf_idx]):
-            actual_y = float(self.data_a[buf_idx])
-        elif self.enable_b and np.isfinite(self.data_b[buf_idx]):
-            actual_y = float(self.data_b[buf_idx])
-        else:
-            actual_y = yv
+        xi, yv = self._screen_to_data(event.x(), event.y())  # xi is time in seconds
+        # Find actual value at this time from our data
+        actual_y = yv
+        if self.times:
+            # Find closest time index
+            idx = 0
+            min_dist = float('inf')
+            for i, t in enumerate(self.times):
+                dist = abs(t - xi)
+                if dist < min_dist:
+                    min_dist = dist
+                    idx = i
+            if self.enable_a and np.isfinite(self.data_a[idx]):
+                actual_y = float(self.data_a[idx])
+            elif self.enable_b and np.isfinite(self.data_b[idx]):
+                actual_y = float(self.data_b[idx])
 
         if event.button() == Qt.LeftButton:
-            self.marker1 = (buf_idx, actual_y)
+            self.marker1 = (xi, actual_y)  # store time, not index
         elif event.button() == Qt.RightButton:
-            self.marker2 = (buf_idx, actual_y)
+            self.marker2 = (xi, actual_y)  # store time, not index
         elif event.button() == Qt.MiddleButton:
             self._pan_origin = event.pos()
-            self._pan_y0     = self.pan_y
+            self._pan_x0 = self.x_min
+            self._pan_y0 = self.pan_y
 
         if self.marker_callback:
             self.marker_callback()
@@ -722,6 +845,7 @@ class ADCMT7352GUI(QMainWindow):
         self.default_digits = 2          # 4½  (RE4)
         self._rec_data_a: list[tuple] = []   # (timestamp, value)
         self._rec_data_b: list[tuple] = []
+        self._capture_start_time: float | None = None
 
         self.init_ui()
         self.statusBar().showMessage("Ready.  Select device and click Connect.")
@@ -736,10 +860,16 @@ class ADCMT7352GUI(QMainWindow):
         root.setSpacing(0)
         root.setContentsMargins(0, 0, 0, 0)
 
-        # ── left settings panel ───────────────────────────────────────
-        left = self._build_left_panel()
-        left.setFixedWidth(290)
-        root.addWidget(left)
+        # ── left settings panel (scrollable) ──────────────────────────
+        left_widget = self._build_left_panel()
+        left_scroll = QScrollArea()
+        left_scroll.setWidget(left_widget)
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        left_scroll.setMinimumWidth(280)
+        left_scroll.setMaximumWidth(420)
+        left_scroll.setStyleSheet("QScrollArea { border: none; background-color: #090c12; }")
 
         # ── right content ─────────────────────────────────────────────
         right = QWidget()
@@ -753,23 +883,41 @@ class ADCMT7352GUI(QMainWindow):
         self.tabs.addTab(self._build_export_tab(),       " Export")
         self.tabs.addTab(self._build_console_tab(),      " ADC Console")
         rl.addWidget(self.tabs)
-        root.addWidget(right, 1)
+
+        # ── splitter for resizable panels ─────────────────────────────
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(left_scroll)
+        splitter.addWidget(right)
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        splitter.setSizes([300, 900])
+        
+        root.addWidget(splitter, 1)
 
     # ── STYLE HELPERS ─────────────────────────────────────────────────
     _GRP = """
         QGroupBox {
             border: 1px solid #30363d; border-radius: 5px;
             margin-top: 10px; padding-top: 8px;
-            background-color: #0d1117;
+            background-color: #0d1117; font-size: 10px;
         }
         QGroupBox::title {
             subcontrol-origin: margin; left: 10px;
             padding: 0 5px; color: #58a6ff; font-weight: bold; font-size: 10px;
         }
+        QGroupBox::indicator {
+            width: 13px; height: 13px;
+        }
+        QGroupBox::indicator:unchecked {
+            image: none;
+        }
+        QGroupBox::indicator:checked {
+            image: none;
+        }
     """
 
     def _grp(self, title):
-        g = QGroupBox(title)
+        g = CollapsibleSection(title)
         g.setStyleSheet(self._GRP)
         return g
 
@@ -784,7 +932,7 @@ class ADCMT7352GUI(QMainWindow):
         layout.setSpacing(5)
 
         # Title
-        t = QLabel("◈  ADCMT 7352A")
+        t = QLabel("ADCMT 7352A")
         t.setStyleSheet("font-size: 15px; font-weight: bold; color: #c9d1d9; padding-top: 4px;")
         layout.addWidget(t)
         s = QLabel("Digital Multimeter  [ADC mode]")
@@ -800,12 +948,14 @@ class ADCMT7352GUI(QMainWindow):
         sbl.addWidget(self.status_dot); sbl.addWidget(self.status_label); sbl.addStretch()
         layout.addWidget(sb)
 
+        # ── Collapsible sections ──────────────────────────────────────
         layout.addWidget(self._build_connection_card())
         layout.addWidget(self._build_channel_card("Channel A  (DSP1)", "A"))
         layout.addWidget(self._build_digits_card())
         layout.addWidget(self._build_channel_card("Channel B  (DSP2)", "B"))
         layout.addWidget(self._build_display_card())
         layout.addWidget(self._build_control_card())
+        
         layout.addStretch()
         return panel
 
@@ -841,7 +991,7 @@ class ADCMT7352GUI(QMainWindow):
         for lbl_txt, attr, items, default_idx in [
             ("Function:", f"cb_func_{ch}", list(ADC_FUNCS.keys()), 0),
             ("Range:",    f"cb_rng_{ch}",  list(ADC_RANGES.keys()), 0),
-            ("Rate:",     f"cb_rate_{ch}", list(ADC_RATES.keys()),  3),
+            ("Rate:",     f"cb_rate_{ch}", list(ADC_RATES.keys()),  2),
             ("Trigger:",  f"cb_trig_{ch}", list(ADC_TRIGS.keys()),  0),
         ]:
             row = QHBoxLayout(); row.addWidget(QLabel(lbl_txt))
@@ -1229,11 +1379,7 @@ class ADCMT7352GUI(QMainWindow):
                 self.inst.timeout = 2000
                 self.inst.read_termination  = '\r\n'
                 self.inst.write_termination = '\r\n'
-                self.send_cmd("H0")
-                self.send_cmd("DE0")
-                self.send_cmd("DSP!,F1")
-                self.send_cmd(DIGITS_CMD[self.default_digits])
-                self.send_cmd("PR4")
+                self._init_instrument()
                 self.btn_connect.setText("Disconnect")
                 self._update_status(True)
                 self.log_console(f"Connected to {self.res_input.text()}", "ok")
@@ -1250,13 +1396,42 @@ class ADCMT7352GUI(QMainWindow):
         self.status_label.setStyleSheet(f"color:{c};font-weight:bold;")
         self.status_dot.setStyleSheet(f"color:{c};font-size:13px;")
 
-    def send_cmd(self, cmd):
-        if not self.inst: return
+    def _send_cmd(self, cmd):
+        """Send command with ERR? check (matching adce7352a_gui2.py)."""
+        if not self.inst: return False
         try:
+            self.log_console(f"Sent: {cmd}", "cmd")
             self.inst.write(cmd)
-            self.log_console(f"Sent: {cmd}", "ok")
+            time.sleep(0.025)  # USB settling time per manual
+            err = self.inst.query("ERR?")
+            if err and not err.startswith("+000"):
+                self.log_console(f"   ERR? → {err}", "err")
+                return False
+            return True
         except Exception as e:
             self.log_console(f"Cmd Error: {e}", "err")
+            return False
+
+    def _init_instrument(self):
+        """Initialize instrument with proper sequence from adce7352a_gui2.py."""
+        self._send_cmd("*RST")
+        time.sleep(0.1)
+        self._send_cmd("H1")   # header ON
+        self._send_cmd("DE0")  # 2nd display OFF
+        self._send_cmd("SD1")  # remote output: 1st display only
+        self._send_cmd("TRS0") # trigger source: IMMEDIATE
+        self._send_cmd("INIC1")# continuous measurement ON
+        # Get IDN
+        try:
+            idn = self.inst.query("*IDN?")
+            self.log_console(f"IDN: {idn}", "ok")
+        except:
+            pass
+        self.log_console("Instrument initialized.", "ok")
+
+    def send_cmd(self, cmd):
+        """Legacy wrapper for backward compatibility."""
+        self._send_cmd(cmd)
 
     def apply_settings(self):
         if not self.inst: return
@@ -1279,6 +1454,14 @@ class ADCMT7352GUI(QMainWindow):
     def toggle_continuous(self, state):
         self.is_continuous = bool(state)
         if self.is_continuous and self.inst:
+            self._capture_start_time = time.time()
+            # Reset plot time base
+            self.gl_plot._t0 = self._capture_start_time
+            self.gl_plot.times.clear()
+            self.gl_plot.x_min = 0.0
+            self.gl_plot.x_max = 10.0
+            self.gl_plot._x_min_auto = 0.0
+            self.gl_plot._x_max_auto = 10.0
             self.poll_timer.start(500)
         else:
             self.poll_timer.stop()
@@ -1290,28 +1473,43 @@ class ADCMT7352GUI(QMainWindow):
     def poll_readings(self):
         if not self.inst: return
         try:
-            self.gl_plot.set_channel_enabled("A", self.chk_enable_A.isChecked())
-            self.gl_plot.set_channel_enabled("B", self.chk_enable_B.isChecked())
+            ch_a_enabled = self.chk_enable_A.isChecked()
+            ch_b_enabled = self.chk_enable_B.isChecked()
+            
+            self.gl_plot.set_channel_enabled("A", ch_a_enabled)
+            self.gl_plot.set_channel_enabled("B", ch_b_enabled)
 
-            resp_a = self.inst.query("DSP1,MD?").strip()
-            resp_b = self.inst.query("DSP2,MD?").strip()
-            fk_a   = _cur_fkey(self.cb_func_A.currentText())
-            fk_b   = _cur_fkey(self.cb_func_B.currentText())
+            # Read only enabled channels using bare read (no query command)
+            resp_a = ""
+            resp_b = ""
+            fk_a   = _cur_fkey(self.cb_func_A.currentText()) if ch_a_enabled else "F1"
+            fk_b   = _cur_fkey(self.cb_func_B.currentText()) if ch_b_enabled else "F1"
 
-            val_a, _, _, is_ol_a, disp_a, _ = parse_adc_response(resp_a, fk_a)
-            val_b, _, _, is_ol_b, disp_b, _ = parse_adc_response(resp_b, fk_b)
+            if ch_a_enabled:
+                if ch_b_enabled: self.inst.write("DSP1")  # select DSP1
+                resp_a = self.inst.read().strip()
+            
+            if ch_b_enabled:
+                self.inst.write("DSP2")  # select DSP2
+                resp_b = self.inst.read().strip()
 
-            self.lbl_a.setText(disp_a if self.chk_enable_A.isChecked() else "--")
-            self.lbl_b.setText(disp_b if self.chk_enable_B.isChecked() else "--")
+            # Parse responses
+            val_a, _, _, is_ol_a, disp_a, _ = parse_adc_response(resp_a, fk_a) if ch_a_enabled else (0.0, "", "_", False, "--", "")
+            val_b, _, _, is_ol_b, disp_b, _ = parse_adc_response(resp_b, fk_b) if ch_b_enabled else (0.0, "", "_", False, "--", "")
 
-            push_a = val_a if not is_ol_a else np.nan
-            push_b = val_b if not is_ol_b else np.nan
+            self.lbl_a.setText(disp_a)
+            self.lbl_b.setText(disp_b)
+
+            push_a = val_a if (ch_a_enabled and not is_ol_a) else np.nan
+            push_b = val_b if (ch_b_enabled and not is_ol_b) else np.nan
             self.gl_plot.update_readings(push_a, push_b)
 
-            # record
+            # record only when enabled
             ts = datetime.now()
-            self._rec_data_a.append((ts, push_a))
-            self._rec_data_b.append((ts, push_b))
+            if ch_a_enabled:
+                self._rec_data_a.append((ts, push_a))
+            if ch_b_enabled:
+                self._rec_data_b.append((ts, push_b))
             self._update_export_preview()
             self.update_statistics()
 
