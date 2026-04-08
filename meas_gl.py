@@ -56,7 +56,7 @@ ADC_TRIGS = {"IMM": "TRS0", "MAN": "TRS1", "EXT": "TRS2", "BUS": "TRS3"}
 DIGITS_CMD  = ["RE3", "RE4", "RE5"]
 DIGITS_DISP = ["3½", "4½", "5½"]
 
-OVERLOAD_THRESHOLD = 9.9e+36
+OVERLOAD_THRESHOLD = 9.9e+9
 
 SUB_LABELS = {
     "_": "",     "O": " [OL]",    "H": " [HI]",  "P": " [PASS]",
@@ -506,7 +506,7 @@ class ADCMT7352GUI(QMainWindow):
         """Create the connection settings card."""
         group = QGroupBox("CONNECTION")
         group.setStyleSheet("""
-            QGroupBox { border: 1px solid #30363d; border-radius: 4px; margin-top: 12px; padding-top: 8px; }
+            QGroupBox { border: 1px solid #30363d; border-radius: 4px; margin-top: 8px; padding-top: 6px; }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #58a6ff; font-weight: bold; }
         """)
         layout = QVBoxLayout(group)
@@ -540,7 +540,7 @@ class ADCMT7352GUI(QMainWindow):
         """Create a channel configuration card."""
         group = QGroupBox(title)
         group.setStyleSheet("""
-            QGroupBox { border: 1px solid #30363d; border-radius: 4px; margin-top: 12px; padding-top: 8px; }
+            QGroupBox { border: 1px solid #30363d; border-radius: 4px; margin-top: 8px; padding-top: 6px; }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #58a6ff; font-weight: bold; }
         """)
         layout = QVBoxLayout(group)
@@ -584,6 +584,7 @@ class ADCMT7352GUI(QMainWindow):
         rate_layout.addWidget(QLabel("Rate:"))
         cb_rate = QComboBox()
         cb_rate.addItems(ADC_RATES.keys())
+        cb_rate.setCurrentIndex(3)  # Default to SLOW2
         setattr(self, f"cb_rate_{channel}", cb_rate)
         rate_layout.addWidget(cb_rate)
         layout.addLayout(rate_layout)
@@ -603,7 +604,7 @@ class ADCMT7352GUI(QMainWindow):
         """Create the digits selection card."""
         group = QGroupBox("DIGITS")
         group.setStyleSheet("""
-            QGroupBox { border: 1px solid #30363d; border-radius: 4px; margin-top: 12px; padding-top: 8px; }
+            QGroupBox { border: 1px solid #30363d; border-radius: 4px; margin-top: 8px; padding-top: 6px; }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #58a6ff; font-weight: bold; }
         """)
         layout = QVBoxLayout(group)
@@ -625,7 +626,7 @@ class ADCMT7352GUI(QMainWindow):
         """Create the LCD display card."""
         group = QGroupBox("LIVE READINGS")
         group.setStyleSheet("""
-            QGroupBox { border: 1px solid #30363d; border-radius: 4px; margin-top: 12px; padding-top: 8px; }
+            QGroupBox { border: 1px solid #30363d; border-radius: 4px; margin-top: 8px; padding-top: 6px; }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #58a6ff; font-weight: bold; }
         """)
         layout = QVBoxLayout(group)
@@ -657,7 +658,7 @@ class ADCMT7352GUI(QMainWindow):
         """Create the control buttons card."""
         group = QGroupBox("CONTROLS")
         group.setStyleSheet("""
-            QGroupBox { border: 1px solid #30363d; border-radius: 4px; margin-top: 12px; padding-top: 8px; }
+            QGroupBox { border: 1px solid #30363d; border-radius: 4px; margin-top: 8px; padding-top: 6px; }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #58a6ff; font-weight: bold; }
         """)
         layout = QVBoxLayout(group)
@@ -1072,11 +1073,10 @@ class ADCMT7352GUI(QMainWindow):
                 
                 # Initialize ADC Mode & Display
                 self.send_cmd("H0")      # Disable headers for easier parsing
-                self.send_cmd("DE1")     # Enable dual display
-                self.send_cmd("DSP1,F1") # Default DCV-Ach
-                self.send_cmd("DSP2,F12")# Default DCV-Bch
-                self.send_cmd(f"DSP1,{DIGITS_CMD[self.default_digits]}")
-                self.send_cmd(f"DSP2,{DIGITS_CMD[self.default_digits]}")
+                self.send_cmd("DE0")     # Disable dual display
+                self.send_cmd("DSP!,F1") # Default DCV-Ach
+                self.send_cmd(f"{DIGITS_CMD[self.default_digits]}")
+                self.send_cmd(f"PR4") # Slow sampling rate
                 self.btn_connect.setText("Disconnect")
                 self._update_status(True)
                 self.log_console(f"Connected to {self.res_input.text()}", "ok")
