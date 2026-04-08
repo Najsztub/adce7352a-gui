@@ -32,13 +32,20 @@ class CollapsibleSection(QGroupBox):
         self.setCheckable(True)
         self.setChecked(True)
         self._toggle_style()
-        self.toggled.connect(self._toggle_style)
+        self.toggled.connect(self._on_toggled)
         
     def _toggle_style(self):
         """Update title with collapse/expand indicator."""
         state = "▼" if self.isChecked() else "▶"
         orig_title = self.title().rstrip(" ▼▶ ")
         self.setTitle(f"{orig_title} {state}")
+    
+    def _on_toggled(self, checked):
+        self._toggle_style()
+        # Show/hide all child widgets
+        for w in self.children():
+            if w != self.layout():  # Skip the layout itself
+                w.setVisible(checked)
 
 # =============================================================================
 
@@ -1048,6 +1055,13 @@ class ADCMT7352GUI(QMainWindow):
         self.chk_cont = QCheckBox("Continuous Read")
         self.chk_cont.stateChanged.connect(self.toggle_continuous)
         lay.addWidget(self.chk_cont)
+        # Refresh rate selector
+        self.cb_rate = QComboBox()
+        self.cb_rate.addItems(["50 ms", "100 ms", "200 ms", "500 ms", "1 s", "2 s"])
+        self.cb_rate.setCurrentIndex(3)  # Default: 500 ms
+        self.cb_rate.setToolTip("Refresh interval for continuous reading")
+        self.cb_rate.currentIndexChanged.connect(self._on_poll_rate_changed)
+        lay.addWidget(self.cb_rate)
         return g
 
     # ================================================================== #
@@ -1468,9 +1482,18 @@ class ADCMT7352GUI(QMainWindow):
             self.gl_plot.x_max = 10.0
             self.gl_plot._x_min_auto = 0.0
             self.gl_plot._x_max_auto = 10.0
-            self.poll_timer.start(500)
+            # Use selected poll rate
+            rate_ms = [50, 100, 200, 500, 1000, 2000][self.cb_rate.currentIndex()]
+            self.poll_timer.start(rate_ms)
         else:
             self.poll_timer.stop()
+
+    def _on_poll_rate_changed(self, index):
+        """Handle poll rate combo change - restart timer if running."""
+        if self.is_continuous and self.poll_timer.isActive():
+            rate_ms = [50, 100, 200, 500, 1000, 2000][index]
+            self.poll_timer.stop()
+            self.poll_timer.start(rate_ms)
 
     def on_device_changed(self, index):
         self.use_mock = (index == 1)
