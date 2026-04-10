@@ -890,7 +890,7 @@ class ADCWindow(QtWidgets.QMainWindow):
         """)
         layout.addWidget(self.console_text)
 
-        self._log_console("ADCMT 7352A [ADC mode, \\r\\n termination]", "info")
+        self._log_console("ADCMT 7352A", "info")
         self._log_console(
             "Free-run: instrument streams data → bare read() used for acquisition.", "info")
 
