@@ -1,6 +1,6 @@
 # ADCMT 7352A Digital Multimeter Controller
 
-Dual-channel measurement GUI for the [ADCMT 7352A](https://www.adcmt.com/en/products/dmm/7352) 6.5-digit multimeter with
+Dual-channel measurement GUI for the [ADCMT 7352A](https://www.adcmt.com/en/products/dmm/7352) 5.5-digit multimeter with
 OpenGL plotting, independent per-channel settings, and real-time statistics/export.
 
 ![Screen capture](doc/screen.png)
