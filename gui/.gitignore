@@ -125,13 +125,9 @@ dmypy.json
 # IDEs
 .vscode/
 .idea/
-*.code-workspace
 *.swp
 *.swo
 *~
-
-# Project
-archive/
 
 # OS
 .DS_Store
