@@ -3,6 +3,8 @@
 Dual-channel measurement GUI for the [ADCMT 7352A](https://www.adcmt.com/en/products/dmm/7352) 6.5-digit multimeter with
 OpenGL plotting, independent per-channel settings, and real-time statistics/export.
 
+![Screen capture](doc/screen.png)
+
 The communication backend has been written based on the [ADCMT 7352A OPERATION
 MANUAL](https://www.manualslib.com/manual/2242207/Adcmt-7352a.html).
 
