@@ -140,14 +140,14 @@ class _GLPlotWidget(QOpenGLWidget):
         self.setMouseTracking(True)
         self._theme = _PLOT_THEMES[True]
         self._ol = _OL_DARK
+        self._theme_dirty = True
 
     ML, MR, MT, MB = 60, 60, 12, 30
 
     def set_theme(self, is_dark):
         self._theme = _PLOT_THEMES[is_dark]
         self._ol = _OL_DARK if is_dark else _OL_LIGHT
-        r, g, b = self._theme["bg"]
-        glClearColor(r, g, b, 1.0)
+        self._theme_dirty = True
         self.update()
 
     def _plot_rect(self):
@@ -303,6 +303,10 @@ class _GLPlotWidget(QOpenGLWidget):
         glViewport(0, 0, w, h)
 
     def paintGL(self):
+        if self._theme_dirty:
+            self._theme_dirty = False
+            r, g, b = self._theme["bg"]
+            glClearColor(r, g, b, 1.0)
         glClear(GL_COLOR_BUFFER_BIT)
         w, h = self.width(), self.height()
         px, py, pw, ph = self._plot_rect()
